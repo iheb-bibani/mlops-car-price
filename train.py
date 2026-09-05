@@ -1,164 +1,215 @@
-import pandas as pd
 import joblib
-
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.pipeline import Pipeline
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error
-
 import mlflow
 import mlflow.sklearn
 
-from mlflow import MlflowClient
+from sklearn.model_selection import train_test_split
+
+from src.data import load_data
+from src.model import train_model
+from src.evaluate import (
+    evaluate_model,
+    check_quality_gate,
+)
+from src.registry import (
+    register_and_promote_model,
+)
 
 
-# 1. Charger les données
-df = pd.read_csv("data/cars_synthetic.csv")
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MLFLOW_TRACKING_URI = "http://localhost:5000"
+EXPERIMENT_NAME = "car-price-prediction"
+MODEL_NAME = "car-price-model"
+MODEL_PATH = "models/car_price_model.pkl"
 
 
-# 2. Définir X et y
-X = df[
-    [
-        "brand",
-        "model",
-        "year",
-        "mileage",
-        "horsepower"
-    ]
-]
+# ============================================================
+# MLFLOW SETUP
+# ============================================================
 
-y = df["price"]
+mlflow.set_tracking_uri(
+    MLFLOW_TRACKING_URI
+)
+
+mlflow.set_experiment(
+    EXPERIMENT_NAME
+)
 
 
-# 3. Train / Test
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+
+print()
+print("Loading data...")
+
+X, y = load_data()
+
+print(
+    f"Dataset loaded: {len(X)} rows"
+)
+
+
+# ============================================================
+# 2. TRAIN / TEST SPLIT
+# ============================================================
+
 X_train, X_test, y_train, y_test = train_test_split(
     X,
     y,
     test_size=0.2,
-    random_state=42
+    random_state=42,
 )
 
 
-# 4. Preprocessing
-categorical_features = ["brand", "model"]
+# ============================================================
+# 3. TRAIN MODEL
+# ============================================================
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        (
-            "cat",
-            OneHotEncoder(handle_unknown="ignore"),
-            categorical_features
-        )
-    ],
-    remainder="passthrough"
+print()
+print("Training model...")
+
+best_model, best_params, mae_cv = train_model(
+    X_train,
+    y_train,
+)
+
+print()
+print(
+    "Best params:",
+    best_params,
 )
 
 
-# 5. Pipeline
-pipeline = Pipeline(
-    steps=[
-        ("preprocessor", preprocessor),
-        (
-            "model",
-            RandomForestRegressor(
-                random_state=42
-            )
-        )
-    ]
+# ============================================================
+# 4. EVALUATION
+# ============================================================
+
+metrics = evaluate_model(
+    model=best_model,
+    X_test=X_test,
+    y_test=y_test,
+    mae_cv=mae_cv,
 )
 
 
-# 6. Hyperparamètres
-param_grid = {
-    "model__n_estimators": [100, 200],
-    "model__max_depth": [None, 8, 12],
-    "model__min_samples_leaf": [1, 2, 5]
-}
+print()
+print("MODEL EVALUATION")
+print("----------------")
 
-
-# 7. Cross-validation + recherche
-grid_search = GridSearchCV(
-    estimator=pipeline,
-    param_grid=param_grid,
-    cv=5,
-    scoring="neg_mean_absolute_error",
-    n_jobs=-1
+print(
+    "MAE CV      :",
+    metrics["mae_cv"],
 )
 
-grid_search.fit(X_train, y_train)
-
-best_model = grid_search.best_estimator_
-
-y_pred = best_model.predict(X_test)
-
-mae_test = mean_absolute_error(
-    y_test,
-    y_pred
+print(
+    "MAE Test    :",
+    metrics["mae_test"],
 )
 
-mae_cv = -grid_search.best_score_
+print(
+    "Latency     :",
+    metrics["latency_ms"],
+    "ms",
+)
 
-MAX_MAE = 4000
 
-mlflow.set_experiment("car-price-prediction")
+# ============================================================
+# 5. QUALITY GATE
+# ============================================================
+
+quality_gate_passed = check_quality_gate(
+    metrics
+)
+
+
+# ============================================================
+# 6. MLFLOW RUN
+# ============================================================
 
 with mlflow.start_run():
 
-    mlflow.log_params(grid_search.best_params_)
+    # --------------------------------------------------------
+    # Log hyperparameters
+    # --------------------------------------------------------
 
-    mlflow.log_metric("mae_cv", mae_cv)
-    mlflow.log_metric("mae_test", mae_test)
+    mlflow.log_params(
+        best_params
+    )
 
-    if mae_test <= MAX_MAE:
+
+    # --------------------------------------------------------
+    # Log metrics
+    # --------------------------------------------------------
+
+    mlflow.log_metrics(
+        metrics
+    )
+
+
+    # --------------------------------------------------------
+    # Quality Gate + Registry
+    # --------------------------------------------------------
+
+    if quality_gate_passed:
+
+        print()
+        print(
+            "Quality gate PASSED"
+        )
+
+        print(
+            "Registering challenger..."
+        )
+
+        register_and_promote_model(
+            model=best_model,
+            metrics=metrics,
+            model_name=MODEL_NAME,
+        )
+
+    else:
+
+        print()
+        print(
+            "Quality gate FAILED"
+        )
+
+        print(
+            "Model NOT registered"
+        )
+
+        # On garde quand même le modèle
+        # comme artifact MLflow.
         mlflow.sklearn.log_model(
             sk_model=best_model,
             name="model",
-            registered_model_name="car-price-model"
         )
 
-        print("Quality gate PASSED")
-        print("Model registered")
 
-    else:
-        mlflow.sklearn.log_model(
-            sk_model=best_model,
-            name="model"
-        )
+# ============================================================
+# 7. LOCAL MODEL SAVE
+# ============================================================
 
-        print("Quality gate FAILED")
-        print("Model NOT registered")
-
-client = MlflowClient()
-
-client.set_registered_model_alias(
-    name="car-price-model",
-    alias="champion",
-    version="2"
-)
-
-# 8. Meilleur modèle
-best_model = grid_search.best_estimator_
-
-
-# 9. Évaluation finale
-y_pred = best_model.predict(X_test)
-
-mae_test = mean_absolute_error(
-    y_test,
-    y_pred
-)
-
-print("Best params :", grid_search.best_params_)
-print("MAE CV      :", -grid_search.best_score_)
-print("MAE Test    :", mae_test)
-
-
-# 10. Sauvegarde
 joblib.dump(
     best_model,
-    "models/car_price_model.pkl"
+    MODEL_PATH,
 )
 
-print("Model saved.")
+
+print()
+print(
+    f"Model saved locally: {MODEL_PATH}"
+)
+
+
+# ============================================================
+# END
+# ============================================================
+
+print()
+print(
+    "Training pipeline finished."
+)

@@ -7,12 +7,14 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
+mlflow.set_tracking_uri(
+    "http://mlflow:5000"
+)
 
 # Charge le modèle qui porte l'alias "champion"
 model = mlflow.sklearn.load_model(
     "models:/car-price-model@champion"
 )
-
 
 class CarInput(BaseModel):
     brand: str
