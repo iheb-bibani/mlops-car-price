@@ -18,32 +18,160 @@ jobs:
 
     steps:
 
-      # 1. Récupérer le code du repository
+      # ======================================================
+      # 1. CHECKOUT
+      # ======================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
 
-      # 2. Installer Python
+      # ======================================================
+      # 2. PYTHON
+      # ======================================================
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
 
-      # 3. Installer les dépendances
+      # ======================================================
+      # 3. DEPENDENCIES
+      # ======================================================
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
 
-      # 4. Lancer les tests
+      # ======================================================
+      # 4. UNIT TESTS
+      # ======================================================
+
       - name: Run tests
         run: |
           pytest -v
 
 
-      # 5. Vérifier que l'image Docker se construit
+      # ======================================================
+      # 5. DOCKER BUILD
+      # ======================================================
+
       - name: Build Docker image
         run: |
           docker build -t car-price-api .
+
+
+      # ======================================================
+      # 6. START MLFLOW
+      # ======================================================
+
+      - name: Start MLflow
+        run: |
+          docker compose up -d mlflow
+
+
+      # ======================================================
+      # 7. WAIT FOR MLFLOW
+      # ======================================================
+
+      - name: Wait for MLflow
+        run: |
+          for i in {1..30}; do
+
+            if curl -f http://localhost:5000/health; then
+              echo "MLflow is ready"
+              exit 0
+            fi
+
+            echo "Waiting for MLflow..."
+            sleep 5
+
+          done
+
+          echo "MLflow failed to start"
+          docker compose logs mlflow
+          exit 1
+
+
+      # ======================================================
+      # 8. TRAIN + REGISTER MODEL
+      # ======================================================
+
+      - name: Train model
+        run: |
+          python train.py
+
+
+      # ======================================================
+      # 9. START API
+      # ======================================================
+
+      - name: Start API
+        run: |
+          docker compose up -d api
+
+
+      # ======================================================
+      # 10. WAIT FOR API
+      # ======================================================
+
+      - name: Wait for API
+        run: |
+          for i in {1..30}; do
+
+            if curl -f http://localhost:8000/; then
+              echo "API is ready"
+              exit 0
+            fi
+
+            echo "Waiting for API..."
+            sleep 5
+
+          done
+
+          echo "API failed to start"
+          docker compose logs api
+          exit 1
+
+
+      # ======================================================
+      # 11. TEST REAL PREDICTION
+      # ======================================================
+
+      - name: Test prediction endpoint
+        run: |
+          curl \
+            --fail \
+            --request POST \
+            http://localhost:8000/predict \
+            --header "Content-Type: application/json" \
+            --data '{
+              "brand": "Toyota",
+              "model": "Yaris",
+              "year": 2021,
+              "mileage": 55000,
+              "horsepower": 129
+            }'
+
+
+      # ======================================================
+      # 12. SHOW LOGS IF SOMETHING FAILED
+      # ======================================================
+
+      - name: Show Docker logs on failure
+        if: failure()
+        run: |
+          docker compose logs
+
+
+      # ======================================================
+      # 13. CLEANUP
+      # ======================================================
+
+      - name: Stop containers
+        if: always()
+        run: |
+          docker compose down
